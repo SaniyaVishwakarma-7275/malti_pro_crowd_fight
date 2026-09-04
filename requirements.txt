@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+pymongo
+python-dotenv
+opencv-python
+torch
+torchvision
+ultralytics
+pytorchvideo
+numpy
+pygame
+streamlit
