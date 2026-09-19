@@ -1,18 +1,14 @@
 import logging
 import os
-from typing import Optional
+import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-import uvicorn
 
-# Database Functions
-from database import get_camera_info, get_all_cameras
-
-# Detection Engines & API Router
 from action_detector import action_engine
 from api_routes import router as api_router
+from database import get_camera_info
 from detector import detector_engine
 
 logging.basicConfig(
@@ -30,10 +26,9 @@ os.makedirs("alerts", exist_ok=True)
 app = FastAPI(
     title="Enterprise AI Surveillance API",
     version="2.0.0",
-    description="Multi-stream AI Surveillance System supporting YOLOv8 Crowd & Action Detection with full REST APIs.",
+    description="Multi-camera dynamic surveillance system powered by YOLOv8, OpenCV, and MongoDB.",
 )
 
-# Enable CORS for external access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,302 +37,310 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/alerts", StaticFiles(directory="alerts"), name="alerts")
+app.mount(
+    "/alerts",
+    StaticFiles(directory="alerts"),
+    name="alerts",
+)
+
 app.include_router(api_router)
 
 
-@app.get("/api/v1/fight-status", tags=["Live Status"])
-def get_fight_status():
-    is_fighting = getattr(action_engine, "is_fighting", False)
-    return {"is_fighting": is_fighting}
-
-
-@app.get("/alarm.wav", include_in_schema=False)
-def get_alarm_sound():
-    if os.path.exists("alarm.wav"):
-        return FileResponse("alarm.wav", media_type="audio/wav")
-    raise HTTPException(status_code=404, detail="alarm.wav file not found")
-
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def index():
-    logger.info("Dashboard requested by client.")
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Enterprise AI Multi-Camera Surveillance System</title>
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0b0e14; color: #fff; text-align: center; padding: 20px; margin: 0; }
-            .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 15px; margin-top: 20px; padding: 10px; }
-            .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
-            img.stream { border-radius: 8px; border: 2px solid #21262d; width: 100%; height: 240px; object-fit: cover; background-color: #000; }
-            h3 { margin-bottom: 8px; color: #58a6ff; font-size: 14px; text-transform: uppercase; }
-            
-            .control-panel { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 15px; margin: 10px auto; max-width: 1200px; display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 10px; }
-            input[type="number"], input[type="text"] { padding: 8px; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #fff; text-align: center; }
-            button { background: #238636; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; }
-            button:hover { background: #2ea043; }
-            .btn-delete { background: #da3633; color: white; border: none; padding: 4px 8px; font-size: 11px; margin-top: 5px; border-radius: 4px; cursor: pointer; }
-            .btn-delete:hover { background: #f85149; }
-
-            .gallery-section { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; width: 100%; margin-top: 20px; box-sizing: border-box; }
-            .gallery-grid { display: flex; gap: 15px; overflow-x: auto; padding: 10px 0; }
-            .alert-card { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 8px; flex: 0 0 auto; text-align: center; }
-            .alert-card img { width: 180px; height: 110px; border-radius: 6px; object-fit: cover; cursor: pointer; }
-            .alert-card p { font-size: 11px; margin: 5px 0 0 0; color: #8b949e; word-break: break-all; width: 180px; }
-            .alert-type { font-weight: bold; color: #f85149; text-transform: uppercase; font-size: 10px; }
-            .cam-badge { background: #1f6beb; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-left: 5px; }
-        </style>
-    </head>
-    <body>
-        <h2>🛡️ Enterprise Multi-Camera AI Surveillance System</h2>
-        <p>Engine: <b>FastAPI REST Architecture + OpenCV + YOLOv8 + MongoDB</b></p>
-        
-        <div class="control-panel">
-            <div>
-                <span>⚙️ <b>Live Crowd Threshold:</b> </span>
-                <input type="number" id="thresholdInput" value="5" min="1">
-                <button onclick="updateThreshold()">POST Update Threshold</button>
-            </div>
-            <div>
-                <button onclick="loadCamerasGrid()">🔄 Reload Camera Streams</button>
-            </div>
-            <div>
-                <a href="/docs" target="_blank" style="color: #58a6ff; text-decoration: none; font-weight: bold;">📑 Open Swagger API Docs</a>
-            </div>
-        </div>
-
-        <!-- Dynamic Multi-Camera Live Stream Grid -->
-        <div class="grid-container" id="cameraGrid">
-            <p style="color: #8b949e; grid-column: 1/-1;">Fetching active cameras from database...</p>
-        </div>
-
-        <div style="max-width: 1220px; margin: 20px auto;">
-            <div class="gallery-section">
-                <h3>🚨 Captured Alerts Gallery (MongoDB Base64)</h3>
-                <div id="gallery" class="gallery-grid">
-                    <p style="color: #8b949e;">Loading alerts...</p>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            let audioCtx = null;
-            let lastAudioTime = 0;
-
-            document.addEventListener('click', () => {
-                if (!audioCtx) {
-                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioCtx.state === 'suspended') {
-                    audioCtx.resume();
-                }
-            }, { once: true });
-
-            function playBrowserBeep() {
-                if (!audioCtx) return;
-                const oscillator = audioCtx.createOscillator();
-                const gainNode = audioCtx.createGain();
-
-                oscillator.type = 'square';
-                oscillator.frequency.setValueAtTime(1500, audioCtx.currentTime);
-                gainNode.gain.setValueAtTime(0.5, audioCtx.currentTime); 
-
-                oscillator.connect(gainNode);
-                gainNode.connect(audioCtx.destination);
-
-                oscillator.start();
-                setTimeout(() => { oscillator.stop(); }, 500);
-            }
-
-            // Dynamic Camera Fetch & Grid Generator
-            async function loadCamerasGrid() {
-                const grid = document.getElementById('cameraGrid');
-                try {
-                    const res = await fetch('/api/v1/cameras');
-                    const data = await res.json();
-                    
-                    if (!data.cameras || data.cameras.length === 0) {
-                        grid.innerHTML = '<p style="color: #8b949e; grid-column: 1/-1;">No cameras registered in Database.</p>';
-                        return;
-                    }
-
-                    grid.innerHTML = '';
-                    data.cameras.forEach(cam => {
-                        const card = document.createElement('div');
-                        card.className = 'card';
-                        
-                        // Action/Fight cameras vs Crowd cameras selection
-                        const streamType = cam.mode === 'fight' ? 'fight' : 'crowd';
-                        const streamUrl = `/api/v1/stream/${streamType}?camera_code=${cam.code}`;
-
-                        card.innerHTML = `
-                            <h3>📷 ${cam.name || cam.code} <span class="cam-badge">${streamType}</span></h3>
-                            <img class="stream" src="${streamUrl}" alt="${cam.code} Stream" onerror="this.src='https://via.placeholder.com/360x240/161b22/8b949e?text=Camera+Offline'">
-                        `;
-                        grid.appendChild(card);
-                    });
-                } catch (e) {
-                    console.error("Error loading cameras:", e);
-                    grid.innerHTML = '<p style="color: #f85149; grid-column: 1/-1;">Error fetching camera list from API.</p>';
-                }
-            }
-
-            async function checkLiveFightStatus() {
-                try {
-                    const res = await fetch('/api/v1/fight-status');
-                    const data = await res.json();
-                    
-                    if (data.is_fighting === true) {
-                        const now = Date.now();
-                        if (now - lastAudioTime > 2000) {
-                            playBrowserBeep();
-                            lastAudioTime = now;
-                        }
-                    }
-                } catch (e) {
-                    console.error("Error checking fight status:", e);
-                }
-            }
-
-            setInterval(checkLiveFightStatus, 800);
-
-            async function fetchAlerts() {
-                try {
-                    const response = await fetch('/api/v1/alerts');
-                    const data = await response.json();
-                    const gallery = document.getElementById('gallery');
-                    
-                    if (!data.alerts || data.alerts.length === 0) {
-                        gallery.innerHTML = '<p style="color: #8b949e; width: 100%;">No critical alerts recorded yet in MongoDB.</p>';
-                        return;
-                    }
-
-                    gallery.innerHTML = '';
-                    data.alerts.forEach(item => {
-                        const card = document.createElement('div');
-                        card.className = 'alert-card';
-
-                        const isObject = typeof item === 'object' && item !== null;
-                        const imageSrc = isObject ? (item.image || `/alerts/${item.filename}`) : `/alerts/${item}`;
-                        const eventId = isObject ? item._id : item;
-                        const eventType = isObject ? (item.eventType || 'Alert') : 'Alert';
-                        const confidence = isObject ? (item.confidence ? (item.confidence * 100).toFixed(0) + '%' : 'N/A') : '';
-
-                        card.innerHTML = `
-                            <a href="${imageSrc}" target="_blank">
-                                <img src="${imageSrc}" alt="Alert Screenshot">
-                            </a>
-                            <p class="alert-type">${eventType} ${confidence ? '(' + confidence + ')' : ''}</p>
-                            <button class="btn-delete" onclick="deleteAlert('${eventId}')">DELETE</button>
-                        `;
-                        gallery.appendChild(card);
-                    });
-                } catch (err) {
-                    console.error("Error fetching alerts:", err);
-                }
-            }
-
-            async function updateThreshold() {
-                const val = document.getElementById('thresholdInput').value;
-                const res = await fetch('/api/v1/settings/threshold', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ new_threshold: parseInt(val) })
-                });
-                const data = await res.json();
-                alert(data.message);
-            }
-
-            async function deleteAlert(eventId) {
-                if(!confirm(`Delete event?`)) return;
-                const res = await fetch(`/api/v1/alerts/${eventId}`, { method: 'DELETE' });
-                await res.json();
-                fetchAlerts();
-            }
-
-            // Initialization
-            loadCamerasGrid();
-            setInterval(fetchAlerts, 5000);
-            fetchAlerts();
-        </script>
-    </body>
-    </html>
-    """
-
-
-# Streaming Endpoint for Crowd Cameras
-# @app.get("/api/v1/stream/crowd", tags=["Streams"])
-# def crowd_video_feed(
-#     camera_code: str = Query(default="OFIC_CH01"),
-#     rtsp_url: Optional[str] = Query(default=None)
-# ):
-#     if rtsp_url:
-#         source = rtsp_url
-#     else:
-#         camera = get_camera_info(camera_code)
-#         if not camera or "rtsp_url" not in camera:
-#             source = "f1.mp4"  # Default fallback video
-#         else:
-#             source = camera["rtsp_url"]
-
-#     return StreamingResponse(
-#         detector_engine.generate_stream_frames(
-#             video_source=source,
-#             camera_key=camera_code,
-#         ),
-#         media_type="multipart/x-mixed-replace; boundary=frame",
-#     )
 @app.get("/api/v1/stream/crowd", tags=["Streams"])
-def crowd_video_feed():
+def crowd_stream(camera_code: str = Query(...)):
+    camera = get_camera_info(camera_code)
+    if not camera:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera '{camera_code}' not found in database",
+        )
 
-    source = "rtsp://admin:Msspl@1234@192.168.1.249:2001/video/live?channel=1&subtype=0"
+    source = camera.get("rtspUrl")
+    if not source:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Camera '{camera_code}' has no configured rtspUrl",
+        )
 
+    logger.info(f"[CROWD STREAM START] {camera_code} -> {source}")
     return StreamingResponse(
-            detector_engine.generate_stream_frames(
+        detector_engine.generate_stream_frames(
             video_source=source,
-            camera_key="OFIC_CH01",
+            camera_key=camera_code,
         ),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-# Streaming Endpoint for Action / Fight Cameras
 @app.get("/api/v1/stream/fight", tags=["Streams"])
-def fight_video_feed(
-    camera_code: str = Query(default="OFIC_CH13"),
-    rtsp_url: Optional[str] = Query(default=None)
-):
-    if rtsp_url:
-        source = rtsp_url
-    else:
-        camera = get_camera_info(camera_code)
-        if not camera or "rtsp_url" not in camera:
-            source = "fi7.avi"  # Default fallback video
-        else:
-            source = camera["rtsp_url"]
+def fight_stream(camera_code: str = Query(...)):
+    camera = get_camera_info(camera_code)
+    if not camera:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera '{camera_code}' not found in database",
+        )
 
+    source = camera.get("rtspUrl")
+    if not source:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Camera '{camera_code}' has no configured rtspUrl",
+        )
+
+    logger.info(f"[FIGHT STREAM START] {camera_code} -> {source}")
     return StreamingResponse(
         action_engine.detect_fight_and_stream(
             video_source=source,
-            camera_key=camera_code
+            camera_key=camera_code,
         ),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-@app.get("/api/v1/health", tags=["Health Check"])
-def health_check():
-    return {
-        "status": "online",
-        "crowd_engine_device": getattr(detector_engine, "device", "cpu"),
-        "action_engine_device": getattr(action_engine, "device", "cpu"),
-    }
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic AI CCTV Multi-Camera Surveillance</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 16px;
+            background: #0d1117;
+            color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .header-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #21262d;
+            margin-bottom: 16px;
+        }
+        .header-bar h2 { margin: 0; color: #58a6ff; }
+        .counter-badge {
+            background: #1f6feb;
+            color: #ffffff;
+            font-size: 13px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: bold;
+        }
+        .controls-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 10px 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        input[type="number"] {
+            width: 75px;
+            padding: 6px 10px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #ffffff;
+        }
+        button {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 7px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        button:hover { background: #2ea043; }
+        .swagger-link { margin-left: auto; color: #58a6ff; text-decoration: none; }
+        #cameraGrid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 16px;
+            margin-bottom: 30px;
+        }
+        .cam-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .cam-card-header {
+            padding: 8px 12px;
+            background: #1c2128;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .cam-video-box { width: 100%; height: 220px; background: #000; }
+        .cam-video-box img { width: 100%; height: 100%; object-fit: cover; }
+        .stream-offline {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #8b949e;
+        }
+        .alerts-section {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+        }
+        #alertsContainer { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+        .alert-item {
+            min-width: 190px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 8px;
+            flex-shrink: 0;
+        }
+        .alert-item img { width: 100%; height: 110px; object-fit: cover; border-radius: 4px; }
+    </style>
+</head>
+<body>
 
+<div class="header-bar">
+    <h2>🛡️ Multi-Camera Surveillance Wall</h2>
+    <span id="camTotalBadge" class="counter-badge">Loading...</span>
+</div>
+
+<div class="controls-card">
+    <label for="thresholdInput">Alert Threshold:</label>
+    <input id="thresholdInput" type="number" min="1" value="5">
+    <button onclick="updateThreshold()">Save Threshold</button>
+    <button onclick="loadCamerasGrid()">🔄 Reload Grid</button>
+    <a class="swagger-link" href="/docs" target="_blank">Swagger API &rarr;</a>
+</div>
+
+<div id="cameraGrid">
+    <div style="grid-column: 1/-1; text-align: center; color: #8b949e;">Fetching registered cameras...</div>
+</div>
+
+<div class="alerts-section">
+    <h3>🚨 Detection Alerts</h3>
+    <div id="alertsContainer">
+        <span style="color: #8b949e; font-size: 13px;">No alerts yet.</span>
+    </div>
+</div>
+
+<script>
+async function loadCamerasGrid() {
+    const grid = document.getElementById("cameraGrid");
+    const badge = document.getElementById("camTotalBadge");
+
+    try {
+        const response = await fetch("/api/v1/cameras");
+        if (!response.ok) throw new Error("API returned " + response.status);
+
+        const result = await response.json();
+        const cameras = result.cameras || [];
+        badge.innerText = cameras.length + " Cameras Online";
+
+        if (cameras.length === 0) {
+            grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color:#8b949e;">No active cameras found.</div>';
+            return;
+        }
+
+        grid.innerHTML = "";
+        cameras.forEach(cam => {
+            const mode = (cam.mode === "fight") ? "fight" : "crowd";
+            const code = cam.code || cam.camera_code || cam._id;
+            const streamUrl = `/api/v1/stream/${mode}?camera_code=${encodeURIComponent(code)}`;
+
+            const card = document.createElement("div");
+            card.className = "cam-card";
+            card.innerHTML = `
+                <div class="cam-card-header">
+                    <span>📷 ${cam.name || code}</span>
+                    <span style="color:#58a6ff; font-size:11px; font-weight:bold;">${mode.toUpperCase()}</span>
+                </div>
+                <div class="cam-video-box">
+                    <img 
+                        src="${streamUrl}" 
+                        alt="${code}"
+                        onerror="this.parentElement.innerHTML='<div class=\\'stream-offline\\'>No RTSP Signal (${code})</div>';"
+                    >
+                </div>
+            `;
+            grid.appendChild(card);
+        });
+    } catch (err) {
+        grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color:#f85149;">Failed to load cameras. Check backend.</div>';
+        badge.innerText = "Error";
+    }
+}
+
+async function loadAlerts() {
+    const container = document.getElementById("alertsContainer");
+    try {
+        const res = await fetch("/api/v1/alerts?limit=15");
+        if (!res.ok) return;
+        const data = await res.json();
+        const alerts = data.alerts || [];
+
+        if (alerts.length === 0) {
+            container.innerHTML = '<span style="color: #8b949e; font-size: 13px;">No alerts yet.</span>';
+            return;
+        }
+
+        container.innerHTML = "";
+        alerts.forEach(item => {
+            const div = document.createElement("div");
+            div.className = "alert-item";
+            div.innerHTML = `
+                ${item.image ? `<img src="${item.image}" alt="Alert Screenshot">` : ""}
+                <b style="color:#f85149; font-size:12px;">${item.eventType || "Detection"}</b>
+                <small style="display:block; color:#8b949e; font-size:11px;">${item.cameraId || "Camera"}</small>
+            `;
+            container.appendChild(div);
+        });
+    } catch(e) {
+        console.error("Alerts fetching failed:", e);
+    }
+}
+
+async function updateThreshold() {
+    const val = Number(document.getElementById("thresholdInput").value);
+    if (val < 1) return alert("Threshold must be at least 1");
+    try {
+        const res = await fetch("/api/v1/settings/threshold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ new_threshold: val })
+        });
+        const json = await res.json();
+        alert(json.message || "Threshold updated!");
+    } catch (e) {
+        alert("Failed to update threshold");
+    }
+}
+
+loadCamerasGrid();
+loadAlerts();
+setInterval(loadAlerts, 5000);
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
-    logger.info("Starting Enterprise AI Surveillance Server on Port 8000...")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    logger.info("Starting AI Surveillance Dynamic Server on port 8000...")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8001,
+    )

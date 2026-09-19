@@ -1,9 +1,10 @@
-from collections import deque
 import base64
 import logging
 import os
 import threading
 import time
+from collections import deque
+from typing import Generator
 
 import cv2
 import torch
@@ -12,24 +13,35 @@ from ultralytics import YOLO
 from alert_manager import alert_helper
 from database import save_detection_event
 
+# ============================================================
+# LOGGING & PATHS
+# ============================================================
+
 logger = logging.getLogger("AI_Surveillance.Detector")
 
-# Absolute Path Resolution
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VIDEO_PATH = os.path.join(BASE_DIR, "f1.mp4")
-DEFAULT_MODEL_PATH = os.path.join(BASE_DIR, "yolov8m.pt")
 
+# Primary and Fallback Model Paths
+PRIMARY_MODEL = os.path.join(BASE_DIR, "yolov8m.pt")
+FALLBACK_MODEL = os.path.join(BASE_DIR, "yolov8n.pt")
+DEFAULT_MODEL_PATH = PRIMARY_MODEL if os.path.exists(PRIMARY_MODEL) else FALLBACK_MODEL
+
+
+# ============================================================
+# SURVEILLANCE ENGINE CLASS
+# ============================================================
 
 class SurveillanceEngine:
 
     def __init__(
         self,
-        model_path=DEFAULT_MODEL_PATH,
-        crowd_threshold=5,
-        crowd_duration=1.0,
-        group_distance_factor=1.5,
-        alert_cooldown=30.0,
-        db_save_cooldown=5.0,
+        model_path: str = DEFAULT_MODEL_PATH,
+        crowd_threshold: int = 5,
+        crowd_duration: float = 1.0,
+        group_distance_factor: float = 1.5,
+        alert_cooldown: float = 30.0,
+        db_save_cooldown: float = 5.0,
     ):
         self.model_path = model_path
         self.crowd_threshold = crowd_threshold
@@ -40,24 +52,26 @@ class SurveillanceEngine:
 
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        # Thread Lock for Thread-Safe Concurrency across Multiple Cameras
+        # Thread Lock for Safe Concurrency Across Multiple Cameras
         self.model_lock = threading.Lock()
 
-        # Per-Camera State Dictionaries (Prevents State Leakage across Streams)
+        # Isolated Per-Camera State Dictionaries
         self.last_db_save_times = {}
         self.last_alert_times = {}
         self.crowd_start_times = {}
         self.crowd_confirmed_states = {}
 
         logger.info(f"[ENGINE] Loading YOLO Model from: {self.model_path}")
-        logger.info(f"[ENGINE] Hardware Accelerator: {self.device}")
+        logger.info(f"[ENGINE] Hardware Device Accelerator: {self.device}")
 
         try:
             self.model = YOLO(self.model_path)
             logger.info("[ENGINE] YOLOv8 Model loaded successfully!")
         except Exception as e:
-            logger.error(f"[ERROR] Failed to load YOLO model: {e}")
-            raise RuntimeError(f"Could not initialize YOLO model: {e}")
+            logger.error(f"[ERROR] Failed to load primary YOLO model '{self.model_path}': {e}")
+            logger.info(f"[ENGINE] Attempting fallback to '{FALLBACK_MODEL}'...")
+            self.model = YOLO(FALLBACK_MODEL)
+            self.model_path = FALLBACK_MODEL
 
     def get_person_data(self, boxes):
         persons = []
@@ -67,10 +81,10 @@ class SurveillanceEngine:
         xyxy = boxes.xyxy.cpu().numpy()
         for box in xyxy:
             x1, y1, x2, y2 = box
-            width = max(1.0, x2 - x1)
-            height = max(1.0, y2 - y1)
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
+            width = max(1.0, float(x2 - x1))
+            height = max(1.0, float(y2 - y1))
+            cx = float(x1 + x2) / 2.0
+            cy = float(y1 + y2) / 2.0
             person_size = (width + height) / 2.0
 
             persons.append({
@@ -82,7 +96,7 @@ class SurveillanceEngine:
 
         return persons
 
-    def are_people_close(self, person_a, person_b):
+    def are_people_close(self, person_a: dict, person_b: dict) -> bool:
         x1, y1 = person_a["center"]
         x2, y2 = person_b["center"]
         distance = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
@@ -90,7 +104,7 @@ class SurveillanceEngine:
         allowed_distance = avg_size * self.group_distance_factor
         return distance <= allowed_distance
 
-    def is_group_compact(self, group, persons):
+    def is_group_compact(self, group: list, persons: list) -> bool:
         if len(group) < self.crowd_threshold:
             return False
 
@@ -109,7 +123,7 @@ class SurveillanceEngine:
 
         return max_spread <= max_allowed_spread
 
-    def detect_crowd_group(self, persons):
+    def detect_crowd_group(self, persons: list) -> bool:
         person_count = len(persons)
         if person_count < self.crowd_threshold:
             return False
@@ -142,74 +156,67 @@ class SurveillanceEngine:
             groups.append(current_group)
 
         for group in groups:
-            if len(
-                group
-            ) >= self.crowd_threshold and self.is_group_compact(group, persons):
+            if len(group) >= self.crowd_threshold and self.is_group_compact(group, persons):
                 return True
 
         return False
 
     def generate_stream_frames(
-        self, video_source=DEFAULT_VIDEO_PATH, camera_key="OFIC_CH16"
-    ):
-        logger.info(
-            f"[STREAM] Opening stream for camera [{camera_key}]: {video_source}"
-        )
+        self,
+        video_source=DEFAULT_VIDEO_PATH,
+        camera_key: str = "OFFI_CH01",
+    ) -> Generator[bytes, None, None]:
+        logger.info(f"[STREAM] Opening stream for camera [{camera_key}]: {video_source}")
 
-        if (
-            not str(video_source).startswith("rtsp")
-            and not str(video_source).startswith("http")
-            and not os.path.exists(str(video_source))
-        ):
-            logger.error(
-                f"[CRITICAL ERROR] Source NOT found for [{camera_key}]: {video_source}"
-            )
-            return
+        is_rtsp = str(video_source).startswith("rtsp://") or str(video_source).startswith("http://")
 
-        cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)
+        # Fallback if local file doesn't exist
+        if not is_rtsp and not os.path.exists(str(video_source)):
+            logger.warning(f"[STREAM] Source file '{video_source}' not found. Falling back to default.")
+            video_source = DEFAULT_VIDEO_PATH
+
+        cap = cv2.VideoCapture(str(video_source), cv2.CAP_FFMPEG)
         if not cap.isOpened():
-            logger.error(
-                f"[CRITICAL ERROR] OpenCV failed to open stream for [{camera_key}]:"
-                f" {video_source}"
-            )
+            logger.error(f"[STREAM ERROR] OpenCV failed to connect to [{camera_key}]: {video_source}")
             return
 
-        # Per-Camera State Initialization
-        self.last_db_save_times.setdefault(camera_key, 0)
-        self.last_alert_times.setdefault(camera_key, 0)
+        # Initialize Camera State Dictionaries
+        self.last_db_save_times.setdefault(camera_key, 0.0)
+        self.last_alert_times.setdefault(camera_key, 0.0)
         self.crowd_start_times.setdefault(camera_key, None)
         self.crowd_confirmed_states.setdefault(camera_key, False)
 
-        frame_count = 0
+        frame_skip = 0
 
         try:
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
-                    if str(video_source).startswith("rtsp"):
-                        logger.warning(
-                            f"[STREAM] RTSP [{camera_key}] interrupted. Re-connecting..."
-                        )
+                    if is_rtsp:
+                        logger.warning(f"[STREAM] RTSP disconnected for [{camera_key}]. Retrying in 2 seconds...")
                         cap.release()
-                        time.sleep(1)
-                        cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)
+                        time.sleep(2)
+                        cap = cv2.VideoCapture(str(video_source), cv2.CAP_FFMPEG)
                         continue
                     else:
-                        logger.warning(
-                            f"[STREAM] End of file [{camera_key}]. Resetting loop..."
-                        )
+                        # Re-loop file video
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         self.crowd_start_times[camera_key] = None
                         self.crowd_confirmed_states[camera_key] = False
                         continue
 
-                frame_count += 1
-                frame = cv2.resize(frame, (854, 480))
+                # Process every 2nd frame to optimize multi-camera GPU usage
+                frame_skip += 1
+                frame = cv2.resize(frame, (640, 360))
 
-                # Thread-safe YOLO Inference Call
+                # Thread-safe GPU Inference
                 with self.model_lock:
                     results = self.model(
-                        frame, device=self.device, classes=[0], verbose=False
+                        frame,
+                        device=self.device,
+                        classes=[0],
+                        verbose=False,
+                        conf=0.4,
                     )
 
                 boxes = results[0].boxes
@@ -224,76 +231,39 @@ class SurveillanceEngine:
                     if self.crowd_start_times[camera_key] is None:
                         self.crowd_start_times[camera_key] = current_time
 
-                    crowd_duration = (
-                        current_time - self.crowd_start_times[camera_key]
-                    )
+                    crowd_duration = current_time - self.crowd_start_times[camera_key]
 
                     if crowd_duration >= self.crowd_duration:
                         if not self.crowd_confirmed_states[camera_key]:
                             self.crowd_confirmed_states[camera_key] = True
-                            logger.warning(
-                                f"[{camera_key}] !!! CROWD CONFIRMED !!! Persons:"
-                                f" {person_count}"
-                            )
+                            logger.warning(f"[{camera_key}] CROWD CONFIRMED! Persons: {person_count}")
 
-                        # Red Visual Overlay Banner
-                        cv2.rectangle(
-                            annotated_frame,
-                            (0, 0),
-                            (annotated_frame.shape[1], 40),
-                            (0, 0, 200),
-                            -1,
-                        )
+                        # Visual Banner
+                        cv2.rectangle(annotated_frame, (0, 0), (annotated_frame.shape[1], 35), (0, 0, 200), -1)
                         cv2.putText(
                             annotated_frame,
-                            f"CRITICAL ALERT: CROWD SURGE! ({person_count} Persons)",
-                            (15, 27),
+                            f"CRITICAL: CROWD SURGE! ({person_count} Persons)",
+                            (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
+                            0.65,
                             (255, 255, 255),
                             2,
                         )
 
-                        # Protected Alert Cooldown check & execution
-                        if (
-                            current_time - self.last_alert_times[camera_key]
-                            >= self.alert_cooldown
-                        ):
+                        # Trigger Audio / System Alert
+                        if current_time - self.last_alert_times[camera_key] >= self.alert_cooldown:
                             try:
-                                alert_helper.trigger_crowd_alert(
-                                    annotated_frame, camera_key=camera_key
-                                )
+                                alert_helper.trigger_crowd_alert(annotated_frame, camera_key=camera_key)
                                 self.last_alert_times[camera_key] = current_time
-                                logger.info(
-                                    f"[{camera_key}] Crowd alert notification sent"
-                                    " successfully."
-                                )
                             except Exception as alert_err:
-                                logger.error(
-                                    f"[{camera_key}] Crowd alert notification failed:"
-                                    f" {alert_err}"
-                                )
+                                logger.error(f"[{camera_key}] Alert trigger failed: {alert_err}")
 
-                        # Protected MongoDB Save check & execution
-                        if (
-                            current_time - self.last_db_save_times[camera_key]
-                            >= self.db_save_cooldown
-                        ):
-                            encode_success, img_buffer = cv2.imencode(".jpg", annotated_frame)
-                            if not encode_success:
-                                logger.error(
-                                    f"[{camera_key}] Failed to encode annotated frame to JPEG"
-                                )
-                            else:
-                                base64_str = "data:image/jpeg;base64," + base64.b64encode(
-                                    img_buffer
-                                ).decode("utf-8")
-                                avg_conf = (
-                                    float(boxes.conf.mean().cpu().numpy())
-                                    if len(boxes) > 0
-                                    else 0.85
-                                )
-
+                        # Save Detection Snapshot to MongoDB
+                        if current_time - self.last_db_save_times[camera_key] >= self.db_save_cooldown:
+                            encode_ok, buffer = cv2.imencode(".jpg", annotated_frame)
+                            if encode_ok:
+                                base64_str = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
+                                avg_conf = float(boxes.conf.mean().cpu().numpy()) if len(boxes) > 0 else 0.85
                                 try:
                                     save_detection_event(
                                         event_type="crowd detection",
@@ -302,76 +272,61 @@ class SurveillanceEngine:
                                         camera_key=camera_key,
                                     )
                                     self.last_db_save_times[camera_key] = current_time
-                                    logger.info(
-                                        f"[{camera_key}] Crowd detection event saved to MongoDB."
-                                    )
-                                except Exception as mongo_err:
-                                    logger.error(
-                                        f"[{camera_key}] MongoDB save failed: {mongo_err}"
-                                    )
-
+                                    logger.info(f"[{camera_key}] Crowd detection event saved to MongoDB.")
+                                except Exception as db_err:
+                                    logger.error(f"[{camera_key}] Database save failed: {db_err}")
                     else:
                         remaining = self.crowd_duration - crowd_duration
-                        cv2.rectangle(
-                            annotated_frame,
-                            (0, 0),
-                            (annotated_frame.shape[1], 40),
-                            (0, 120, 200),
-                            -1,
-                        )
+                        cv2.rectangle(annotated_frame, (0, 0), (annotated_frame.shape[1], 35), (0, 120, 200), -1)
                         cv2.putText(
                             annotated_frame,
-                            f"CROWD CHECKING... {remaining:.1f}s",
-                            (15, 27),
+                            f"CROWD CHECKING... {remaining:.1f}s ({person_count})",
+                            (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
+                            0.65,
                             (255, 255, 255),
                             2,
                         )
                 else:
-                    # Reset state when crowd disperses
                     self.crowd_start_times[camera_key] = None
                     self.crowd_confirmed_states[camera_key] = False
 
-                    cv2.rectangle(
-                        annotated_frame,
-                        (0, 0),
-                        (annotated_frame.shape[1], 40),
-                        (0, 150, 0),
-                        -1,
-                    )
+                    cv2.rectangle(annotated_frame, (0, 0), (annotated_frame.shape[1], 35), (0, 150, 0), -1)
                     cv2.putText(
                         annotated_frame,
-                        f"STATUS: NORMAL | Person Count: {person_count}",
-                        (15, 27),
+                        f"STATUS: NORMAL | Persons: {person_count}",
+                        (10, 24),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
+                        0.65,
                         (255, 255, 255),
                         2,
                     )
 
-                # Output Stream Frame Encoding with Validation
-                stream_encode_success, buffer = cv2.imencode(
-                    ".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                # MJPEG Frame Output
+                encode_ok, frame_buffer = cv2.imencode(
+                    ".jpg",
+                    annotated_frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 75],
                 )
-                if not stream_encode_success:
-                    logger.error(
-                        f"[{camera_key}] Failed to encode stream frame to JPEG"
-                    )
+                if not encode_ok:
                     continue
 
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n"
-                    + buffer.tobytes()
+                    + frame_buffer.tobytes()
                     + b"\r\n"
                 )
 
         finally:
             cap.release()
+            logger.info(f"[STREAM] Stream released for camera [{camera_key}]")
 
 
-# Global Detector Engine Shared Instance
+# ============================================================
+# SHARED INSTANCE
+# ============================================================
+
 detector_engine = SurveillanceEngine(
     crowd_threshold=5,
     crowd_duration=1.0,
